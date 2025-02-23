@@ -1,0 +1,144 @@
+//Codigo individual do modulo rtc e wifi
+
+include <stdio.h>
+#include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"
+
+#include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"
+#include "lwip/udp.h"
+#include "lwip/dns.h"
+#include "hardware/rtc.h"
+
+// Configurações da rede Wi-Fi
+#define WIFI_SSID "CLARO_2C7995"
+#define WIFI_PASSWORD "A4AuyRc#tT"
+
+// Configurações NTP
+#define NTP_SERVER "time.google.com"
+#define NTP_PORT 123
+#define NTP_MSG_LEN 48  // Tamanho do pacote NTP
+#define NTP_DELTA 2208988800ULL  // Segundos entre 1900 e 1970 (epoch Unix)
+
+// Variáveis globais
+static struct udp_pcb *udp;
+static ip_addr_t ntp_server_addr;
+static bool ntp_request_sent = false;
+
+void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port) {
+    if (p->len >= NTP_MSG_LEN) {
+        uint8_t *buf = (uint8_t *)p->payload;
+        printf("Bytes NTP (40-43): %02x %02x %02x %02x\n", buf[40], buf[41], buf[42], buf[43]);
+        
+        // Calcula o timestamp NTP corretamente (big-endian)
+        uint32_t ntp_seconds = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) | 
+                              ((uint32_t)buf[42] << 8) | (uint32_t)buf[43];
+        printf("Timestamp NTP bruto: %u\n", ntp_seconds);
+
+        uint32_t unix_seconds = ntp_seconds - NTP_DELTA;  // UTC
+        printf("Timestamp Unix (UTC): %u\n", unix_seconds);
+
+        // Ajuste para fuso horário UTC-3 (Brasil, se necessário)
+        unix_seconds -= (3 * 3600);  // Subtrai 3 horas para UTC-3
+
+        time_t rawtime = unix_seconds;
+        struct tm *timeinfo = gmtime(&rawtime);
+        if (timeinfo) {
+            datetime_t dt = {
+                .year  = timeinfo->tm_year + 1900,
+                .month = timeinfo->tm_mon + 1,
+                .day   = timeinfo->tm_mday,
+                .dotw  = timeinfo->tm_wday,
+                .hour  = timeinfo->tm_hour,
+                .min   = timeinfo->tm_min,
+                .sec   = timeinfo->tm_sec
+            };
+
+            rtc_set_datetime(&dt);
+            printf("Horário definido (UTC-3): %04d-%02d-%02d %02d:%02d:%02d\n",
+                   dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
+        } else {
+            printf("Erro ao converter timestamp para struct tm\n");
+        }
+    }
+    pbuf_free(p);
+    ntp_request_sent = false;
+}
+
+void ntp_request(void) {
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
+    uint8_t *req = (uint8_t *)p->payload;
+    memset(req, 0, NTP_MSG_LEN);
+    req[0] = 0x1B;  // LeapIndicator = 0, Version = 3, Mode = 3 (client)
+
+    udp_sendto(udp, p, &ntp_server_addr, NTP_PORT);
+    pbuf_free(p);
+    ntp_request_sent = true;
+}
+
+void dns_callback(const char *name, const ip_addr_t *ipaddr, void *callback_arg) {
+    if (ipaddr != NULL) {
+        ntp_server_addr = *ipaddr;
+        printf("Endereço NTP resolvido: %s\n", ipaddr_ntoa(ipaddr));
+        ntp_request();
+    } else {
+        printf("Falha ao resolver o endereço NTP\n");
+    }
+}
+
+int main() {
+    stdio_init_all();
+
+    // Inicializa o RTC
+    rtc_init();
+
+    // Inicializa o Wi-Fi
+    if (cyw43_arch_init()) {
+        printf("Erro ao inicializar Wi-Fi\n");
+        return 1;
+    }
+
+    cyw43_arch_enable_sta_mode();
+    printf("Conectando ao Wi-Fi...\n");
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 10000)) {
+        printf("Falha ao conectar ao Wi-Fi\n");
+        return 1;
+    }
+    printf("Conectado ao Wi-Fi\n");
+
+    // Configura o cliente UDP
+    udp = udp_new();
+    udp_bind(udp, IP_ADDR_ANY, 0);
+    udp_recv(udp, ntp_recv_callback, NULL);
+
+    // Resolve o endereço do servidor NTP via DNS
+    err_t err = dns_gethostbyname(NTP_SERVER, &ntp_server_addr, dns_callback, NULL);
+    if (err == ERR_INPROGRESS) {
+        printf("Resolvendo endereço NTP...\n");
+    } else if (err == ERR_OK) {
+        dns_callback(NTP_SERVER, &ntp_server_addr, NULL);  // Endereço já resolvido
+    } else {
+        printf("Erro no DNS: %d\n", err);
+    }
+
+    // Loop principal
+    while (true) {
+        cyw43_arch_poll();  // Processa eventos de rede
+        sleep_ms(100);
+
+        if (!ntp_request_sent) {
+            datetime_t t;
+            if (rtc_get_datetime(&t)) {
+                printf("Horário atual: %04d-%02d-%02d %02d:%02d:%02d\n",
+                       t.year, t.month, t.day, t.hour, t.min, t.sec);
+            }
+            sleep_ms(900);  // Atualiza a cada ~1s
+        }
+    }
+
+    // Cleanup (nunca alcançado neste exemplo)
+    udp_remove(udp);
+    cyw43_arch_deinit();
+    return 0;
+}
+

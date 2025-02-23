@@ -1,0 +1,337 @@
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"
+#include "lwip/udp.h"
+#include "lwip/dns.h"
+#include "hardware/rtc.h"
+#include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/pwm.h"
+#include "hardware/clocks.h"
+ 
+// Definições de pinos
+#define BUTTON_PIN 5        // Botão para capturar horário atual
+#define JOYSTICK_VRY_PIN 26 // Pino ADC para o eixo Y do joystick
+#define BUZZER_PIN 21        // Pino para o buzzer (GPIO 6, saída digital)
+
+// Configuração da frequência do buzzer (em Hz)
+#define BUZZER_FREQUENCY 100
+
+
+// Configurações da rede Wi-Fi
+#define WIFI_SSID "CLARO_2C7995"
+#define WIFI_PASSWORD "A4AuyRc#tT"
+
+// Configurações NTP
+#define NTP_SERVER "time.google.com"
+#define NTP_PORT 123
+#define NTP_MSG_LEN 48  // Tamanho do pacote NTP
+#define NTP_DELTA 2208988800ULL  // Segundos entre 1900 e 1970 (epoch Unix)
+
+// Variáveis globais
+static struct udp_pcb *udp;
+static ip_addr_t ntp_server_addr;
+static bool ntp_request_sent = false;
+
+// Estados do sistema
+enum State {
+    IDLE,
+    SET_ALARM_HOURS,
+    SET_ALARM_MINUTES,
+    ALARM_SET
+} current_state = IDLE;
+
+// Variáveis para o alarme
+int alarm_hours = 0;  // 0-23
+int alarm_minutes = 0; // 0-59
+static rtc_callback_t alarm_callback = NULL;
+
+// Função para configurar o joystick (pinos de leitura e ADC)
+void setup_joystick() {
+    adc_init();         // Inicializa o módulo ADC
+    adc_gpio_init(JOYSTICK_VRY_PIN); // Configura o pino do eixo Y para entrada ADC
+}
+
+// Função para configurar o botão
+void setup_button() {
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN); // Pull-up para evitar flutuações
+}
+
+ // Inicializa o PWM no pino do buzzer
+ void pwm_init_buzzer(uint pin) {
+    // Configurar o pino como saída de PWM
+    gpio_set_function(pin, GPIO_FUNC_PWM);
+
+    // Obter o slice do PWM associado ao pino
+    uint slice_num = pwm_gpio_to_slice_num(pin);
+
+    // Configurar o PWM com frequência desejada
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, clock_get_hz(clk_sys) / (BUZZER_FREQUENCY * 4096)); // Divisor de clock
+    pwm_init(slice_num, &config, true);
+
+    // Iniciar o PWM no nível baixo
+    pwm_set_gpio_level(pin, 0);
+}
+
+// Função para tocar o buzzer passivo por 5 segundos com PWM (2 kHz, 50% duty cycle)
+void buzzer_on(uint pin, uint duration_ms) {
+    printf("Buzzer ativado n");
+    // Obter o slice do PWM associado ao pino
+    uint slice_num = pwm_gpio_to_slice_num(pin);
+
+    // Configurar o duty cycle para 50% (ativo)
+    pwm_set_gpio_level(pin, 2048);
+
+    // Temporização
+    sleep_ms(duration_ms);
+
+    // Desativar o sinal PWM (duty cycle 0)
+    pwm_set_gpio_level(pin, 0);
+
+    // Pausa entre os beeps
+    sleep_ms(100); // Pausa de 100ms
+}
+
+// Função para ler o eixo Y do joystick
+void joystick_read_axis(uint16_t *eixo_y) {
+    adc_select_input(0);     // Seleciona o canal ADC 0 (eixo Y)
+    sleep_us(2);            // Pequeno delay para estabilidade
+    *eixo_y = adc_read();   // Lê o valor do eixo Y (0-4095)
+}
+
+// Função para verificar o movimento do joystick e ajustar horas/minutos
+void handle_joystick_input(uint16_t eixo_y, int *value, int max_value) {
+    const uint16_t CENTER_RANGE_MIN = 1980;  // Posição inicial
+    const uint16_t CENTER_RANGE_MAX = 1983;
+    const uint16_t UP_THRESHOLD = 4090;      // Totalmente para cima
+    const uint16_t DOWN_THRESHOLD = 25;      // Totalmente para baixo
+
+    if (eixo_y >= UP_THRESHOLD) {
+        (*value)++;
+        if (*value > max_value) *value = 0; // Rolla de volta para 0
+        printf("%02d:%02d\n", alarm_hours, alarm_minutes);
+    } else if (eixo_y <= DOWN_THRESHOLD) {
+        (*value)--;
+        if (*value < 0) *value = max_value; // Rolla para o máximo
+        printf("%02d:%02d\n", alarm_hours, alarm_minutes);
+    }
+}
+
+// Callback do alarme RTC
+static void alarm_handler(void) {
+    printf("Alarme disparado! Verificando horário atual...\n");
+    datetime_t t;
+    if (rtc_get_datetime(&t)) {
+        printf("Horário atual: %02d:%02d:%02d\n", t.hour, t.min, t.sec);
+    } else {
+        printf("Erro ao ler horário atual no alarme\n");
+    }
+    buzzer_on(BUZZER_PIN, 500); // Ativa o buzzer quando o alarme dispara
+}
+
+void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port) {
+    if (p->len >= NTP_MSG_LEN) {
+        uint8_t *buf = (uint8_t *)p->payload;
+        printf("Bytes NTP (40-43): %02x %02x %02x %02x\n", buf[40], buf[41], buf[42], buf[43]);
+        
+        // Calcula o timestamp NTP corretamente (big-endian)
+        uint32_t ntp_seconds = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) | 
+                              ((uint32_t)buf[42] << 8) | (uint32_t)buf[43];
+        printf("Timestamp NTP bruto: %u\n", ntp_seconds);
+
+        uint32_t unix_seconds = ntp_seconds - NTP_DELTA;  // UTC
+        printf("Timestamp Unix (UTC): %u\n", unix_seconds);
+
+        // Ajuste para fuso horário UTC-3 (Brasil, se necessário)
+        unix_seconds -= (3 * 3600);  // Subtrai 3 horas para UTC-3
+
+        time_t rawtime = unix_seconds;
+        struct tm *timeinfo = gmtime(&rawtime);
+        if (timeinfo) {
+            datetime_t dt = {
+                .year  = timeinfo->tm_year + 1900,
+                .month = timeinfo->tm_mon + 1,
+                .day   = timeinfo->tm_mday,
+                .dotw  = timeinfo->tm_wday,
+                .hour  = timeinfo->tm_hour,
+                .min   = timeinfo->tm_min,
+                .sec   = timeinfo->tm_sec
+            };
+
+            rtc_set_datetime(&dt);
+            printf("Horário definido (UTC-3): %04d-%02d-%02d %02d:%02d:%02d\n",
+                   dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
+        } else {
+            printf("Erro ao converter timestamp para struct tm\n");
+        }
+    }
+    pbuf_free(p);
+    ntp_request_sent = false;
+}
+
+void ntp_request(void) {
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
+    uint8_t *req = (uint8_t *)p->payload;
+    memset(req, 0, NTP_MSG_LEN);
+    req[0] = 0x1B;  // LeapIndicator = 0, Version = 3, Mode = 3 (client)
+
+    udp_sendto(udp, p, &ntp_server_addr, NTP_PORT);
+    pbuf_free(p);
+    ntp_request_sent = true;
+}
+
+void dns_callback(const char *name, const ip_addr_t *ipaddr, void *callback_arg) {
+    if (ipaddr != NULL) {
+        ntp_server_addr = *ipaddr;
+        printf("Endereço NTP resolvido: %s\n", ipaddr_ntoa(ipaddr));
+        ntp_request();
+    } else {
+        printf("Falha ao resolver o endereço NTP\n");
+    }
+}
+
+int main() {
+    stdio_init_all();
+
+    // Inicializa o RTC
+    rtc_init();
+
+    // Configura os periféricos
+    setup_joystick();
+    setup_button();
+    pwm_init_buzzer(BUZZER_PIN);
+
+    // Inicializa o Wi-Fi
+    if (cyw43_arch_init()) {
+        printf("Erro ao inicializar Wi-Fi\n");
+        return 1;
+    }
+
+    cyw43_arch_enable_sta_mode();
+    printf("Conectando ao Wi-Fi...\n");
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 10000)) {
+        printf("Falha ao conectar ao Wi-Fi\n");
+        return 1;
+    }
+    printf("Conectado ao Wi-Fi\n");
+
+    // Configura o cliente UDP
+    udp = udp_new();
+    udp_bind(udp, IP_ADDR_ANY, 0);
+    udp_recv(udp, ntp_recv_callback, NULL);
+
+    // Resolve o endereço do servidor NTP via DNS
+    err_t err = dns_gethostbyname(NTP_SERVER, &ntp_server_addr, dns_callback, NULL);
+    if (err == ERR_INPROGRESS) {
+        printf("Resolvendo endereço NTP...\n");
+    } else if (err == ERR_OK) {
+        dns_callback(NTP_SERVER, &ntp_server_addr, NULL);  // Endereço já resolvido
+    } else {
+        printf("Erro no DNS: %d\n", err);
+    }
+
+    // Loop principal
+    uint16_t valor_y;
+    while (true) {
+        cyw43_arch_poll();  // Processa eventos de rede
+
+        // Lê o horário atual do RTC apenas no estado IDLE
+        if (current_state == IDLE) {
+            datetime_t current_time;
+            if (rtc_get_datetime(&current_time)) {
+                printf("Horário atual: %02d:%02d:%02d\n", current_time.hour, current_time.min, current_time.sec);
+            }
+        }
+
+        // Lida com o estado atual do sistema
+        switch (current_state) {
+            case IDLE:
+                if (!gpio_get(BUTTON_PIN)) { // Se o botão for pressionado (nível baixo)
+                    sleep_ms(50); // Debounce
+                    while (!gpio_get(BUTTON_PIN)); // Espera o botão ser solto
+                    datetime_t current_time;
+                    rtc_get_datetime(&current_time);
+                    alarm_hours = current_time.hour;
+                    alarm_minutes = current_time.min;
+                    printf("Horário atual capturado para alarme: %02d:%02d\n", alarm_hours, alarm_minutes);
+                    current_state = SET_ALARM_HOURS;
+                    printf("Defina as horas do alarme\n");
+                    printf("%02d:%02d\n", alarm_hours, alarm_minutes);
+                }
+                break;
+
+            case SET_ALARM_HOURS:
+                joystick_read_axis(&valor_y);
+                handle_joystick_input(valor_y, &alarm_hours, 23); // Ajusta horas (0-23)
+                if (!gpio_get(BUTTON_PIN)) { // Se o botão for pressionado
+                    sleep_ms(50); // Debounce
+                    while (!gpio_get(BUTTON_PIN)); // Espera o botão ser solto
+                    current_state = SET_ALARM_MINUTES;
+                    printf("Defina os minutos do alarme\n");
+                }
+                break;
+
+            case SET_ALARM_MINUTES:
+                joystick_read_axis(&valor_y);
+                handle_joystick_input(valor_y, &alarm_minutes, 59); // Ajusta minutos (0-59)
+                if (!gpio_get(BUTTON_PIN)) { // Se o botão for pressionado
+                    sleep_ms(50); // Debounce
+                    while (!gpio_get(BUTTON_PIN)); // Espera o botão ser solto
+                    current_state = ALARM_SET;
+
+                    // Configura o alarme no RTC
+                    datetime_t alarm_time = {
+                        .year  = 2025,  // Ano atual (ajuste conforme necessário)
+                        .month = 2,     // Mês atual (ajuste conforme necessário)
+                        .day   = 21,    // Dia atual (ajuste conforme necessário)
+                        .dotw  = 5,     // Dia da semana (ajuste conforme necessário)
+                        .hour  = alarm_hours,
+                        .min   = alarm_minutes,
+                        .sec   = 0      // Segundos (0 para disparar no início do minuto)
+                    };
+
+                    printf("Configurando alarme para %02d:%02d:00...\n", alarm_hours, alarm_minutes);
+
+                    // Desativa qualquer alarme anterior
+                    rtc_disable_alarm();
+                    printf("Alarme anterior desativado.\n");
+
+                    // Configura o callback do alarme
+                    alarm_callback = alarm_handler;
+                    printf("Callback do alarme configurado.\n");
+
+                    // Define o alarme com repetição diária (usando -1 para campos não relevantes)
+                    alarm_time.year = -1;  // Não importa o ano
+                    alarm_time.month = -1; // Não importa o mês
+                    alarm_time.day = -1;   // Não importa o dia
+                    alarm_time.dotw = -1;  // Não importa o dia da semana
+                    alarm_time.sec = -1;   // Não importa os segundos
+
+                    rtc_set_alarm(&alarm_time, alarm_callback);
+                    printf("Alarme setado no RTC.\n");
+
+                    rtc_enable_alarm();
+                    printf("Alarme ativado no RTC.\n");
+
+                    printf("Alarme programado para %02d:%02d com sucesso\n", alarm_hours, alarm_minutes);
+                }
+                break;
+
+            case ALARM_SET:
+                // Mantém o loop verificando o horário atual e disparando o alarme
+                sleep_ms(1000); // Atualiza a cada segundo
+                break;
+        }
+
+        sleep_ms(100); // Pequeno delay para maior responsividade
+    }
+
+    // Cleanup (nunca alcançado neste exemplo)
+    udp_remove(udp);
+    cyw43_arch_deinit();
+    return 0;
+}
+   
